@@ -4,9 +4,9 @@ Set-StrictMode -Version Latest
 $script:ConfigDir  = [System.IO.Path]::Combine($env:LOCALAPPDATA, 'GenesysConversationAnalysis')
 $script:ConfigFile = [System.IO.Path]::Combine($script:ConfigDir, 'config.json')
 
-$script:DefaultCoreModulePath = 'G:\Development\20_Staging\GenesysCloud\Genesys.Core\src\ps-module\Genesys.Core\Genesys.Core.psd1'
-$script:DefaultCatalogPath    = 'G:\Development\20_Staging\GenesysCloud\Genesys.Core\catalog\genesys-core.catalog.json'
-$script:DefaultSchemaPath     = 'G:\Development\20_Staging\GenesysCloud\Genesys.Core\catalog\schema\genesys-core.catalog.schema.json'
+$script:DefaultCoreModulePath = '..\Genesys.Core\src\ps-module\Genesys.Core\Genesys.Core.psd1'
+$script:DefaultCatalogPath    = '..\Genesys.Core\catalog\genesys-core.catalog.json'
+$script:DefaultSchemaPath     = '..\Genesys.Core\catalog\schema\genesys-core.catalog.schema.json'
 
 function _GetDefaultOutputRoot {
     return [System.IO.Path]::Combine($env:LOCALAPPDATA, 'GenesysConversationAnalysis', 'runs')
@@ -22,7 +22,7 @@ function Get-AppConfig {
         CatalogPath     = $script:DefaultCatalogPath
         SchemaPath      = $script:DefaultSchemaPath
         OutputRoot      = _GetDefaultOutputRoot
-        Region          = 'mypurecloud.com'
+        Region          = 'usw2.pure.cloud'
         PageSize        = 50
         PreviewPageSize = 25
         MaxRecentRuns   = 20
@@ -30,7 +30,7 @@ function Get-AppConfig {
         LastStartDate   = ''
         LastEndDate     = ''
         PkceClientId    = ''
-        PkceRedirectUri = 'http://localhost:8080/callback'
+        PkceRedirectUri = 'http://localhost:8085/callback'
     }
 
     if (-not [System.IO.File]::Exists($script:ConfigFile)) {
