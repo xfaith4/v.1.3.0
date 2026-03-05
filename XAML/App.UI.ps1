@@ -97,6 +97,7 @@ function Register-EventHandlers {
 
     # Header
     if ($c.ContainsKey('BtnConnect'))       { $c.BtnConnect.add_Click({ Handle-ConnectClick }) }
+    if ($c.ContainsKey('BtnSettings'))      { $c.BtnSettings.add_Click({ Handle-SettingsClick }) }
 
     # Run Configuration
     if ($c.ContainsKey('BtnPreviewRun'))    { $c.BtnPreviewRun.add_Click({ Handle-RunClick -IsPreview $true }) }
@@ -106,6 +107,8 @@ function Register-EventHandlers {
 
     # Conversations Tab
     if ($c.ContainsKey('BtnSearch'))        { $c.BtnSearch.add_Click({ Handle-SearchClick }) }
+    if ($c.ContainsKey('CmbFilterDirection')) { $c.CmbFilterDirection.add_SelectionChanged({ Handle-SearchClick }) }
+    if ($c.ContainsKey('CmbFilterMedia'))     { $c.CmbFilterMedia.add_SelectionChanged({ Handle-SearchClick }) }
     if ($c.ContainsKey('BtnPrevPage'))      { $c.BtnPrevPage.add_Click({ Handle-PagingClick -Direction 'Prev' }) }
     if ($c.ContainsKey('BtnNextPage'))      { $c.BtnNextPage.add_Click({ Handle-PagingClick -Direction 'Next' }) }
     if ($c.ContainsKey('BtnExportPageCsv')) { $c.BtnExportPageCsv.add_Click({ Handle-ExportClick -Scope 'Page' }) }
@@ -114,6 +117,10 @@ function Register-EventHandlers {
 
     # Drilldown Tab
     if ($c.ContainsKey('BtnGenerateReport')) { $c.BtnGenerateReport.add_Click({ Handle-GenerateReportClick }) }
+    if ($c.ContainsKey('BtnExpandJson'))     { $c.BtnExpandJson.add_Click({ Handle-ExpandJsonClick }) }
+
+    # Run Console Tab
+    if ($c.ContainsKey('BtnCopyDiagnostics')) { $c.BtnCopyDiagnostics.add_Click({ Handle-CopyDiagnosticsClick }) }
 }
 
 function Initialize-Application {
@@ -193,12 +200,15 @@ function Handle-ConnectClick {
     if ($c.ContainsKey('BtnConnect')) { $c.BtnConnect.IsEnabled = $false }
 
     try {
-        $clientId     = $env:GENESYS_CLIENT_ID
-        $clientSecret = $env:GENESYS_CLIENT_SECRET
-        $region       = if ($env:GENESYS_REGION) { $env:GENESYS_REGION } else { 'usw2.pure.cloud' }
+        $authMode = if ($env:GENESYS_AUTH_MODE) { $env:GENESYS_AUTH_MODE.ToLower() } else { 'client_credentials' }
+        $region   = if ($env:GENESYS_REGION) { $env:GENESYS_REGION } else { 'usw2.pure.cloud' }
 
-        if ([string]::IsNullOrWhiteSpace($clientId) -or [string]::IsNullOrWhiteSpace($clientSecret)) {
-            throw @"
+        switch ($authMode) {
+            'client_credentials' {
+                $clientId     = $env:GENESYS_CLIENT_ID
+                $clientSecret = $env:GENESYS_CLIENT_SECRET
+                if ([string]::IsNullOrWhiteSpace($clientId) -or [string]::IsNullOrWhiteSpace($clientSecret)) {
+                    throw @"
 GENESYS_CLIENT_ID and GENESYS_CLIENT_SECRET must be set before connecting.
 
 Set them in your PowerShell session:
@@ -208,13 +218,23 @@ Set them in your PowerShell session:
 
 Then restart the app or re-click Connect.
 "@
+                }
+                $script:State.AuthContext = Connect-App -ClientId $clientId -ClientSecret $clientSecret -Region $region
+            }
+            'bearer' {
+                # Connect-App reads GENESYS_BEARER_TOKEN internally for bearer mode.
+                $script:State.AuthContext = Connect-App -Region $region
+            }
+            default {
+                # Delegate to Connect-App; it will throw an informative error for unknown modes.
+                $script:State.AuthContext = Connect-App -ClientId $env:GENESYS_CLIENT_ID -ClientSecret $env:GENESYS_CLIENT_SECRET -Region $region
+            }
         }
 
-        $script:State.AuthContext = Connect-App -ClientId $clientId -ClientSecret $clientSecret -Region $region
-
+        $displayMode = $authMode.ToUpper()
         if ($c.ContainsKey('ElpConnStatus'))      { $c.ElpConnStatus.Fill      = [System.Windows.Media.Brushes]::LightGreen }
-        if ($c.ContainsKey('LblConnectionStatus')) { $c.LblConnectionStatus.Text = "Connected  |  $region  |  Client Credentials" }
-        Update-Status "Connected to $region"
+        if ($c.ContainsKey('LblConnectionStatus')) { $c.LblConnectionStatus.Text = "Connected  |  $region  |  $displayMode" }
+        Update-Status "Connected to $region ($displayMode)"
     } catch {
         if ($c.ContainsKey('ElpConnStatus'))       { $c.ElpConnStatus.Fill      = [System.Windows.Media.Brushes]::Salmon }
         if ($c.ContainsKey('LblConnectionStatus')) { $c.LblConnectionStatus.Text = 'Connection failed' }
@@ -226,6 +246,13 @@ Then restart the app or re-click Connect.
 }
 
 function Handle-RunClick($IsPreview) {
+    # Guard: offline mode and connection state checked together for clarity.
+    if ($script:State.IsOffline) {
+        [System.Windows.MessageBox]::Show(
+            'The app is running in offline mode. Run features are disabled.',
+            'Offline Mode', 'OK', 'Information')
+        return
+    }
     if (-not $script:State.AuthContext) {
         [System.Windows.MessageBox]::Show(
             'Please connect to Genesys Cloud first (click Connect).',
@@ -235,11 +262,30 @@ function Handle-RunClick($IsPreview) {
 
     $c = $script:State.Controls
 
-    # Assemble parameters
-    $datasetKey = if ($IsPreview) { 'analytics-conversation-details-query' } else { 'analytics-conversation-details' }
+    # Validate date selection before accessing .Value (SelectedDate is Nullable<DateTime>)
+    if (-not $c.ContainsKey('DtpStartDate') -or -not $c.DtpStartDate.SelectedDate.HasValue) {
+        [System.Windows.MessageBox]::Show('Please select a start date.', 'Date Required', 'OK', 'Warning')
+        return
+    }
+    if (-not $c.ContainsKey('DtpEndDate') -or -not $c.DtpEndDate.SelectedDate.HasValue) {
+        [System.Windows.MessageBox]::Show('Please select an end date.', 'Date Required', 'OK', 'Warning')
+        return
+    }
+
     $start = $c.DtpStartDate.SelectedDate.Value.ToUniversalTime()
     $end   = $c.DtpEndDate.SelectedDate.Value.ToUniversalTime()
+
+    if ($end -le $start) {
+        [System.Windows.MessageBox]::Show(
+            'End date must be after start date.',
+            'Invalid Date Range', 'OK', 'Warning')
+        return
+    }
+
     $interval = "{0:s}Z/{1:s}Z" -f $start, $end
+
+    # Choose the correct dataset key based on whether this is a preview or full run.
+    $datasetKey = if ($IsPreview) { 'analytics-conversation-details-query' } else { 'analytics-conversation-details' }
 
     # Build filters from UI controls
     $segmentFilters     = [System.Collections.Generic.List[object]]::new()
@@ -319,15 +365,40 @@ function Handle-SearchClick {
     $c          = $script:State.Controls
     $searchText = if ($c.ContainsKey('TxtSearch')) { $c.TxtSearch.Text } else { '' }
 
-    if ([string]::IsNullOrWhiteSpace($searchText)) {
-        $script:State.FilteredIndex = $script:State.RunIndex
-        Update-Status 'Search cleared.'
-    } else {
+    # Read post-extraction filter values from the Conversations toolbar combos.
+    $filterDirection = ''
+    if ($c.ContainsKey('CmbFilterDirection') -and $c.CmbFilterDirection.SelectedItem) {
+        $sel = $c.CmbFilterDirection.SelectedItem.Content
+        if ($sel -ne 'All directions') { $filterDirection = $sel }
+    }
+    $filterMedia = ''
+    if ($c.ContainsKey('CmbFilterMedia') -and $c.CmbFilterMedia.SelectedItem) {
+        $sel = $c.CmbFilterMedia.SelectedItem.Content
+        if ($sel -ne 'All media') { $filterMedia = $sel }
+    }
+
+    $filtered = @($script:State.RunIndex)
+
+    if (-not [string]::IsNullOrWhiteSpace($searchText)) {
         $lo = $searchText.ToLowerInvariant()
-        $script:State.FilteredIndex = @($script:State.RunIndex | Where-Object {
-            $_.ConversationId -like "*$lo*"
-        })
-        Update-Status "Found $($script:State.FilteredIndex.Count) matches for '$searchText'."
+        $filtered = @($filtered | Where-Object { $_.ConversationId -like "*$lo*" })
+    }
+    if (-not [string]::IsNullOrWhiteSpace($filterDirection)) {
+        $filtered = @($filtered | Where-Object { $_.Direction -eq $filterDirection })
+    }
+    if (-not [string]::IsNullOrWhiteSpace($filterMedia)) {
+        $filtered = @($filtered | Where-Object { $_.MediaType -eq $filterMedia })
+    }
+
+    $script:State.FilteredIndex = $filtered
+
+    $hasFilter = (-not [string]::IsNullOrWhiteSpace($searchText)) -or
+                 (-not [string]::IsNullOrWhiteSpace($filterDirection)) -or
+                 (-not [string]::IsNullOrWhiteSpace($filterMedia))
+    if ($hasFilter) {
+        Update-Status "Found $($script:State.FilteredIndex.Count) matches."
+    } else {
+        Update-Status 'Filters cleared.'
     }
     Load-ConversationPage -PageIndex 0
 }
@@ -370,6 +441,63 @@ function Handle-GenerateReportClick {
     }
 }
 
+function Handle-SettingsClick {
+    $cfg = Get-AppConfig
+    $msg = @"
+Current Application Settings
+─────────────────────────────────────────
+  Output Root   : $($cfg.OutputRoot)
+  Core Module   : $(if ($env:GENESYS_CORE_MODULE_PATH) { $env:GENESYS_CORE_MODULE_PATH } else { '(not set)' })
+  Auth Module   : $(if ($env:GENESYS_AUTH_MODULE_PATH) { $env:GENESYS_AUTH_MODULE_PATH } else { '(not set)' })
+  Auth Mode     : $(if ($env:GENESYS_AUTH_MODE) { $env:GENESYS_AUTH_MODE } else { 'client_credentials (default)' })
+  Region        : $(if ($env:GENESYS_REGION) { $env:GENESYS_REGION } else { 'usw2.pure.cloud (default)' })
+  Page Size     : $($script:State.PageSize)
+  Offline Mode  : $($script:State.IsOffline)
+
+To change settings update environment variables or create appsettings.json.
+Run ./scripts/Invoke-Smoke.ps1 -Verbose for full diagnostics.
+"@
+    [System.Windows.MessageBox]::Show($msg, 'Settings', 'OK', 'Information')
+}
+
+function Handle-CopyDiagnosticsClick {
+    $c        = $script:State.Controls
+    $diagText = if ($c.ContainsKey('TxtDiagnostics')) { $c.TxtDiagnostics.Text } else { '' }
+    $progress = if ($c.ContainsKey('TxtRunProgress'))  { $c.TxtRunProgress.Text } else { '' }
+    $connected = if ($script:State.AuthContext) { 'Yes' } else { 'No' }
+    $text = @"
+=== Diagnostics Snapshot ===
+Core Module  : $(if ($env:GENESYS_CORE_MODULE_PATH) { $env:GENESYS_CORE_MODULE_PATH } else { '(not set)' })
+Auth Module  : $(if ($env:GENESYS_AUTH_MODULE_PATH) { $env:GENESYS_AUTH_MODULE_PATH } else { '(not set)' })
+Auth Mode    : $(if ($env:GENESYS_AUTH_MODE) { $env:GENESYS_AUTH_MODE } else { 'client_credentials' })
+Region       : $(if ($env:GENESYS_REGION) { $env:GENESYS_REGION } else { '(not set)' })
+Connected    : $connected
+Run Progress : $progress
+
+$diagText
+"@
+    try {
+        [System.Windows.Clipboard]::SetText($text)
+        Update-Status 'Diagnostics copied to clipboard.'
+    } catch {
+        Update-Status "Could not copy to clipboard: $($_.Exception.Message)"
+    }
+}
+
+function Handle-ExpandJsonClick {
+    $c = $script:State.Controls
+    if (-not $c.ContainsKey('TxtRawJson') -or [string]::IsNullOrEmpty($c.TxtRawJson.Text)) {
+        Update-Status 'No JSON to copy. Select a conversation first.'
+        return
+    }
+    try {
+        [System.Windows.Clipboard]::SetText($c.TxtRawJson.Text)
+        Update-Status 'Raw JSON copied to clipboard.'
+    } catch {
+        Update-Status "Could not copy JSON to clipboard: $($_.Exception.Message)"
+    }
+}
+
 function Handle-PagingClick($Direction) {
     $newIndex = $script:State.PageIndex
     if ($Direction -eq 'Next') { $newIndex++ }
@@ -401,8 +529,11 @@ function Handle-ConversationSelectionChanged {
             foreach ($s in $p.sessions) {
                 if (-not $s.PSObject.Properties['segments']) { continue }
                 foreach ($seg in $s.segments) {
-                    try { $seg.PSObject.Properties.Add([psnoteproperty]::new('ParticipantPurpose', $p.purpose)) } catch { }
-                    try { $seg.PSObject.Properties.Add([psnoteproperty]::new('ParticipantName',    $p.participantName)) } catch { }
+                    # The XAML column {Binding Purpose} expects a 'Purpose' property on each
+                    # segment row.  Genesys segments don't carry purpose natively – it lives on
+                    # the parent participant – so we promote it here.
+                    try { $seg.PSObject.Properties.Add([psnoteproperty]::new('Purpose',         $p.purpose)) } catch { }
+                    try { $seg.PSObject.Properties.Add([psnoteproperty]::new('ParticipantName', $p.participantName)) } catch { }
                     $allSegments.Add($seg)
                 }
             }

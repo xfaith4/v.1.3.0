@@ -35,11 +35,17 @@ function New-Warn {
 
 function Get-AppFiles {
     param([string]$Root)
-    $exclude = @('\bin\', '\obj\', '\.git\', '\.venv\', '\node_modules\', '\scripts\')
+    # Use a platform-appropriate separator so the exclusions work on both Windows and Linux.
+    $sep = [System.IO.Path]::DirectorySeparatorChar
+    $exclude = @(
+        "${sep}bin${sep}", "${sep}obj${sep}", "${sep}.git${sep}",
+        "${sep}.venv${sep}", "${sep}node_modules${sep}"
+    )
     Get-ChildItem -Path $Root -Recurse -File |
         Where-Object {
-            ($_.Extension -in @('.ps1', '.psm1', '.psd1', '.xaml', '.json', '.md')) -and
-            (-not ($exclude | Where-Object { $_.FullName.Contains($_) }))
+            $file = $_
+            ($file.Extension -in @('.ps1', '.psm1', '.psd1', '.xaml', '.json', '.md')) -and
+            (-not ($exclude | Where-Object { $file.FullName.Contains($_) }))
         }
 }
 
@@ -64,11 +70,17 @@ Write-Host "    Repo root: $RepoRoot"
 Write-Host ""
 
 # ── Identify app source files ─────────────────────────────────────────────────
-$appFiles = Get-AppFiles -Root $RepoRoot
-$psFiles  = $appFiles | Where-Object { $_.Extension -in @('.ps1', '.psm1', '.psd1') } |
-                Select-Object -ExpandProperty FullName
-$mdFiles  = $appFiles | Where-Object { $_.Extension -eq '.md' } |
-                Select-Object -ExpandProperty FullName
+$appFiles = @(Get-AppFiles -Root $RepoRoot)
+# Exclude tooling/meta-scripts from app-source compliance scans.
+# These files contain pattern strings and legacy shims that would create false positives.
+$thisScript = $MyInvocation.MyCommand.Path
+$psFiles  = @($appFiles | Where-Object {
+    $_.Extension -in @('.ps1', '.psm1', '.psd1') -and
+    $_.FullName -ne $thisScript -and
+    $_.Name -notmatch '^(Invoke-Smoke|Run-ConversationAnalytics)\.ps1$'
+} | Select-Object -ExpandProperty FullName)
+$mdFiles  = @($appFiles | Where-Object { $_.Extension -eq '.md' } |
+                Select-Object -ExpandProperty FullName)
 
 if (-not $psFiles) { New-Fail "No PowerShell files found under RepoRoot: $RepoRoot"; exit 1 }
 
@@ -77,7 +89,7 @@ if (-not $psFiles) { New-Fail "No PowerShell files found under RepoRoot: $RepoRo
 # ─────────────────────────────────────────────────────────────────────────────
 Write-Host "--- Gate D: Forbidden API patterns ---"
 $forbiddenPattern = '(Invoke-RestMethod|Invoke-WebRequest|/api/v2/)'
-$forbiddenHits    = Select-StringSafe -Paths $psFiles -Pattern $forbiddenPattern
+$forbiddenHits = @(Select-StringSafe -Paths $psFiles -Pattern $forbiddenPattern)
 if ($forbiddenHits.Count -gt 0) {
     New-Fail "Forbidden API patterns found. App must not call Genesys endpoints directly." `
              ($forbiddenHits | Select-Object Path, LineNumber, Line)
@@ -105,7 +117,7 @@ if ($coreCopied) {
 Write-Host ""
 Write-Host "--- Gate: Core import boundary ---"
 $importPattern = '(Import-Module\s+.*Genesys\.Core|Assert-Catalog|Invoke-Dataset)'
-$importHits    = Select-StringSafe -Paths $psFiles -Pattern $importPattern
+$importHits = @(Select-StringSafe -Paths $psFiles -Pattern $importPattern)
 
 if (-not $importHits) {
     New-Fail "No evidence of Genesys.Core usage found. App must use Genesys.Core via App.CoreAdapter.psm1."
@@ -119,8 +131,8 @@ if (-not $importHits) {
             New-Fail "App.CoreAdapter.psm1 does not contain Assert-Catalog and/or Invoke-Dataset usage."
         } else {
             # Ensure Import-Module Genesys.Core only appears in CoreAdapter
-            $importCoreHits = Select-StringSafe -Paths $psFiles -Pattern 'Import-Module\s+.*Genesys\.Core'
-            $importOutside  = $importCoreHits | Where-Object { $_.Path -ne $coreAdapter }
+            $importCoreHits = @(Select-StringSafe -Paths $psFiles -Pattern 'Import-Module\s+.*Genesys\.Core')
+            $importOutside  = @($importCoreHits | Where-Object { $_.Path -ne $coreAdapter })
             if ($importOutside) {
                 New-Fail "Genesys.Core imported outside App.CoreAdapter.psm1." `
                          ($importOutside | Select-Object Path, LineNumber, Line)
@@ -136,7 +148,7 @@ if (-not $importHits) {
 # ─────────────────────────────────────────────────────────────────────────────
 Write-Host ""
 Write-Host "--- Gate: StrictMode ---"
-$strictHits = Select-StringSafe -Paths $psFiles -Pattern 'Set-StrictMode\s+-Version\s+Latest'
+$strictHits = @(Select-StringSafe -Paths $psFiles -Pattern 'Set-StrictMode\s+-Version\s+Latest')
 if (-not $strictHits) {
     New-Fail "Set-StrictMode -Version Latest not found in any PowerShell file."
 } else {
@@ -145,10 +157,17 @@ if (-not $strictHits) {
 
 # ─────────────────────────────────────────────────────────────────────────────
 # GATE: Parser gotcha – $var: in double-quoted strings
+# Flags bare `$name:` expansions that PowerShell may misinterpret as a drive
+# qualifier.  Sub-expressions like $($env:X) and known scope modifiers
+# (env:, script:, global:, local:, private:, using:) are intentionally excluded.
 # ─────────────────────────────────────────────────────────────────────────────
 Write-Host ""
 Write-Host "--- Gate: Variable colon gotcha ---"
-$colonVarHits = Select-StringSafe -Paths $psFiles -Pattern '"[^"]*\$[A-Za-z_][A-Za-z0-9_]*:'
+# The negative lookahead skips sub-expression starts `$(` / `${` and all
+# known PowerShell scope/drive qualifiers so that valid constructs like
+# $($env:X), $($script:Y), etc. are not incorrectly flagged.
+$colonVarPattern  = '"[^"]*\$(?![\(\{]|env:|script:|global:|local:|private:|using:|function:|variable:|PSDrive:)[A-Za-z_][A-Za-z0-9_]*:'
+$colonVarHits = @(Select-StringSafe -Paths $psFiles -Pattern $colonVarPattern)
 if ($colonVarHits) {
     New-Fail "Potential PowerShell parser issue: variable followed by ':' in double-quoted string. Use `$(`$var): form." `
              ($colonVarHits | Select-Object Path, LineNumber, Line)
@@ -217,8 +236,8 @@ if (Test-Path -LiteralPath $readmePath) {
 }
 
 # Also check all .md files
-$allMdDeprecatedHits = Select-StringSafe -Paths $mdFiles -Pattern $deprecatedPathPattern
-$allMdUnlabelled = $allMdDeprecatedHits | Where-Object { $_.Line -notmatch '(?i)(deprecated|legacy|shim|old)' }
+$allMdDeprecatedHits = @(Select-StringSafe -Paths $mdFiles -Pattern $deprecatedPathPattern)
+$allMdUnlabelled = @($allMdDeprecatedHits | Where-Object { $_.Line -notmatch '(?i)(deprecated|legacy|shim|old)' })
 if ($allMdUnlabelled) {
     New-Warn "Some .md files reference deprecated src/ps-module paths. Review:"
     $allMdUnlabelled | Select-Object Path, LineNumber, Line | Format-Table | Out-String | Write-Host
@@ -229,7 +248,7 @@ if ($allMdUnlabelled) {
 # ─────────────────────────────────────────────────────────────────────────────
 Write-Host ""
 Write-Host "--- Gate: Resolve-DependencyPaths ---"
-$resolverHits = Select-StringSafe -Paths $psFiles -Pattern 'function\s+Resolve-DependencyPaths'
+$resolverHits = @(Select-StringSafe -Paths $psFiles -Pattern 'function\s+Resolve-DependencyPaths')
 if (-not $resolverHits) {
     New-Fail "Resolve-DependencyPaths function not found in any module. Required for deterministic path resolution."
 } else {
