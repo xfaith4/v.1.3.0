@@ -49,12 +49,26 @@ function Build-RunIndex {
                     $userIds = @([regex]::Matches($line, '"userId":\s*"([^"]+)"') | ForEach-Object { $_.Groups[1].Value })
                     $queueIds = @([regex]::Matches($line, '"queueId":\s*"([^"]+)"') | ForEach-Object { $_.Groups[1].Value })
 
+                    # Extract direction – Genesys surfaces this as originatingDirection at
+                    # conversation level or as direction at session level; try both.
+                    $dirMatch = [regex]::Match($line, '"originatingDirection":\s*"([^"]+)"')
+                    if (-not $dirMatch.Success) {
+                        $dirMatch = [regex]::Match($line, '"direction":\s*"([^"]+)"')
+                    }
+                    $direction = if ($dirMatch.Success) { $dirMatch.Groups[1].Value } else { '' }
+
+                    # Extract the first mediaType found (session-level field).
+                    $mediaMatch = [regex]::Match($line, '"mediaType":\s*"([^"]+)"')
+                    $mediaType  = if ($mediaMatch.Success) { $mediaMatch.Groups[1].Value } else { '' }
+
                     $indexEntry = [PSCustomObject]@{
                         ConversationId    = $convId
                         File              = $filePath
                         Offset            = $byteOffset
                         # Pre-parsed fields for grid performance and filtering
                         ConversationStart = if ($startTimeMatch.Success) { [datetime]$startTimeMatch.Groups[1].Value } else { $null }
+                        Direction         = $direction
+                        MediaType         = $mediaType
                         # Store unique IDs for reporting and filtering
                         DivisionIds       = $divisionIds | Select-Object -Unique
                         UserIds           = $userIds | Select-Object -Unique

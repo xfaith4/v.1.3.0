@@ -46,11 +46,28 @@ function Start-CoreExtraction {
 
     # Gate B: All extraction MUST happen via Invoke-Dataset.
     # The call is wrapped in Start-Job to keep the UI responsive.
+    #
+    # IMPORTANT: Start-Job creates a clean PowerShell runspace that does not
+    # inherit the parent session's loaded modules.  We must explicitly import
+    # Genesys.Core inside the scriptblock so Invoke-Dataset is available.
+    $coreModulePath = $env:GENESYS_CORE_MODULE_PATH
+    if ([string]::IsNullOrWhiteSpace($coreModulePath)) {
+        throw "GENESYS_CORE_MODULE_PATH is not set. Cannot start extraction job."
+    }
+
+    $jobParams = [ordered]@{
+        DatasetKey        = $DatasetKey
+        AuthContext       = $AuthContext
+        OutputRoot        = $OutputRoot
+        DatasetParameters = $DatasetParameters
+    }
+
     $scriptBlock = {
-        param($params)
+        param($corePath, $params)
+        Import-Module $corePath -Force -ErrorAction Stop
         Invoke-Dataset @params
     }
-    return Start-Job -ScriptBlock $scriptBlock -ArgumentList (New-Object psobject -Property $PSBoundParameters)
+    return Start-Job -ScriptBlock $scriptBlock -ArgumentList $coreModulePath, $jobParams
 }
 
 Export-ModuleMember -Function 'Initialize-CoreAdapter', 'Start-CoreExtraction'
