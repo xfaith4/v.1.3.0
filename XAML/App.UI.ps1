@@ -3,20 +3,21 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 #region Module Imports and State
-# Import other application modules
+# Import other application modules (paths are relative to this script's directory)
 $scriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Definition
-Import-Module (Join-Path $scriptRoot 'App.Auth.psm1') -Force
-Import-Module (Join-Path $scriptRoot 'App.CoreAdapter.psm1') -Force
-Import-Module (Join-Path $scriptRoot 'App.Index.psm1') -Force
-Import-Module (Join-Path $scriptRoot 'App.Export.psm1') -Force
-Import-Module (Join-Path $scriptRoot 'App.Reporting.psm1') -Force
+
+Import-Module (Join-Path $scriptRoot 'App.Auth.psm1')       -Force -ErrorAction Stop
+Import-Module (Join-Path $scriptRoot 'App.CoreAdapter.psm1') -Force -ErrorAction Stop
+Import-Module (Join-Path $scriptRoot 'App.Index.psm1')       -Force -ErrorAction Stop
+Import-Module (Join-Path $scriptRoot 'App.Export.psm1')      -Force -ErrorAction Stop
+Import-Module (Join-Path $scriptRoot 'App.Reporting.psm1')   -Force -ErrorAction Stop
 
 # Application state container
 $script:State = [PSCustomObject]@{
     Window          = $null
     Controls        = @{}
     AuthContext     = $null
-    CurrentRun      = $null # Holds info about the active or loaded run
+    CurrentRun      = $null        # Holds info about the active or loaded run
     CurrentRunJob   = $null
     JobStatePoller  = $null
     RunMonitorTimer = $null
@@ -25,87 +26,151 @@ $script:State = [PSCustomObject]@{
     RunIndex        = @()
     FilteredIndex   = @()
     RunDataView     = [System.Collections.ObjectModel.ObservableCollection[object]]::new()
+    IsOffline       = ($env:APP_OFFLINE -eq '1')
 }
 #endregion
 
 #region UI Initialization
+
 function Show-ConversationAnalysisWindow {
-    # Load XAML and map controls
+    # ── Load XAML ────────────────────────────────────────────────────────────
     try {
         Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
+
         $xamlPath = Join-Path $scriptRoot 'MainWindow.xaml'
-        $reader = [System.Xml.XmlNodeReader]::new((Get-Content $xamlPath -Raw).psobject.BaseObject)
-        $script:State.Window = [System.Windows.Markup.XamlReader]::Load($reader)
-    }
-    catch {
-        [System.Windows.MessageBox]::Show("Failed to load MainWindow.xaml: $($_.Exception.Message)", "Fatal Error", "OK", "Error")
+        if (-not [System.IO.File]::Exists($xamlPath)) {
+            throw "MainWindow.xaml not found at: $xamlPath"
+        }
+
+        # Strip x:Class so WPF does not look for a compiled backing class
+        $xamlContent = [System.IO.File]::ReadAllText($xamlPath, [System.Text.Encoding]::UTF8)
+        $xamlContent = $xamlContent -replace 'x:Class="[^"]*"', ''
+
+        $reader = New-Object System.IO.StringReader($xamlContent)
+        $xmlReader = [System.Xml.XmlReader]::Create($reader)
+        try {
+            $script:State.Window = [System.Windows.Markup.XamlReader]::Load($xmlReader)
+        } finally {
+            $xmlReader.Dispose()
+            $reader.Dispose()
+        }
+    } catch {
+        [System.Windows.MessageBox]::Show(
+            "Failed to load MainWindow.xaml:`n$($_.Exception.Message)",
+            'Genesys Conversation Analysis - Fatal Error', 'OK', 'Error')
         return
     }
 
-    # Map all named controls from XAML to a hashtable for easy access
-    $namedControls = $script:State.Window.Content.FindName('*', $script:State.Window.Content) | ForEach-Object { $_.Name } | Where-Object { $_ }
-    foreach ($controlName in $namedControls) {
-        $control = $script:State.Window.FindName($controlName)
-        if ($control) {
-            $script:State.Controls[$controlName] = $control
-        }
-    }
+    # ── Map named controls via logical tree traversal ─────────────────────────
+    _MapNamedControls $script:State.Window
 
-    # Wire up event handlers
+    # ── Wire event handlers ───────────────────────────────────────────────────
     Register-EventHandlers
 
-    # Initialize application state
+    # ── Initialize application state ──────────────────────────────────────────
     Initialize-Application
 
-    # Show the window
+    # ── Show window ───────────────────────────────────────────────────────────
     $null = $script:State.Window.ShowDialog()
 }
 
+function _MapNamedControls {
+    param([System.Windows.DependencyObject]$root)
+    # Recursively walk the logical tree and collect all FrameworkElements with a Name.
+    $queue = New-Object System.Collections.Generic.Queue[System.Windows.DependencyObject]
+    $queue.Enqueue($root)
+    while ($queue.Count -gt 0) {
+        $node = $queue.Dequeue()
+        if ($node -is [System.Windows.FrameworkElement] -and -not [string]::IsNullOrEmpty($node.Name)) {
+            $script:State.Controls[$node.Name] = $node
+        }
+        foreach ($child in [System.Windows.LogicalTreeHelper]::GetChildren($node)) {
+            if ($child -is [System.Windows.DependencyObject]) {
+                $queue.Enqueue($child)
+            }
+        }
+    }
+}
+
 function Register-EventHandlers {
+    $c = $script:State.Controls
+
     # Header
-    $script:State.Controls.BtnConnect.add_Click({ Handle-ConnectClick })
+    if ($c.ContainsKey('BtnConnect'))       { $c.BtnConnect.add_Click({ Handle-ConnectClick }) }
 
     # Run Configuration
-    $script:State.Controls.BtnPreviewRun.add_Click({ Handle-RunClick -IsPreview $true })
-    $script:State.Controls.BtnRun.add_Click({ Handle-RunClick -IsPreview $false })
-    $script:State.Controls.BtnCancelRun.add_Click({ Handle-CancelRunClick })
-    $script:State.Controls.BtnOpenRun.add_Click({ Handle-OpenRunClick })
+    if ($c.ContainsKey('BtnPreviewRun'))    { $c.BtnPreviewRun.add_Click({ Handle-RunClick -IsPreview $true }) }
+    if ($c.ContainsKey('BtnRun'))           { $c.BtnRun.add_Click({ Handle-RunClick -IsPreview $false }) }
+    if ($c.ContainsKey('BtnCancelRun'))     { $c.BtnCancelRun.add_Click({ Handle-CancelRunClick }) }
+    if ($c.ContainsKey('BtnOpenRun'))       { $c.BtnOpenRun.add_Click({ Handle-OpenRunClick }) }
 
     # Conversations Tab
-    $script:State.Controls.BtnSearch.add_Click({ Handle-SearchClick })
-    $script:State.Controls.BtnPrevPage.add_Click({ Handle-PagingClick -Direction 'Prev' })
-    $script:State.Controls.BtnNextPage.add_Click({ Handle-PagingClick -Direction 'Next' })
-    $script:State.Controls.BtnExportPageCsv.add_Click({ Handle-ExportClick -Scope 'Page' })
-    $script:State.Controls.BtnExportRunCsv.add_Click({ Handle-ExportClick -Scope 'Run' })
-    $script:State.Controls.DgConversations.add_SelectionChanged({ Handle-ConversationSelectionChanged })
+    if ($c.ContainsKey('BtnSearch'))        { $c.BtnSearch.add_Click({ Handle-SearchClick }) }
+    if ($c.ContainsKey('BtnPrevPage'))      { $c.BtnPrevPage.add_Click({ Handle-PagingClick -Direction 'Prev' }) }
+    if ($c.ContainsKey('BtnNextPage'))      { $c.BtnNextPage.add_Click({ Handle-PagingClick -Direction 'Next' }) }
+    if ($c.ContainsKey('BtnExportPageCsv')) { $c.BtnExportPageCsv.add_Click({ Handle-ExportClick -Scope 'Page' }) }
+    if ($c.ContainsKey('BtnExportRunCsv'))  { $c.BtnExportRunCsv.add_Click({ Handle-ExportClick -Scope 'Run' }) }
+    if ($c.ContainsKey('DgConversations'))  { $c.DgConversations.add_SelectionChanged({ Handle-ConversationSelectionChanged }) }
 
     # Drilldown Tab
-    $script:State.Controls.BtnGenerateReport.add_Click({ Handle-GenerateReportClick })
-
-    # Run Console Tab
-    # $script:State.Controls.BtnCopyDiagnostics.add_Click({ Handle-CopyDiagnosticsClick })
+    if ($c.ContainsKey('BtnGenerateReport')) { $c.BtnGenerateReport.add_Click({ Handle-GenerateReportClick }) }
 }
 
 function Initialize-Application {
-    # Set default dates
-    $script:State.Controls.DtpStartDate.SelectedDate = (Get-Date).Date.AddDays(-1)
-    $script:State.Controls.DtpEndDate.SelectedDate = (Get-Date).Date
+    $c = $script:State.Controls
+
+    # Set default date range
+    if ($c.ContainsKey('DtpStartDate')) { $c.DtpStartDate.SelectedDate = (Get-Date).Date.AddDays(-1) }
+    if ($c.ContainsKey('DtpEndDate'))   { $c.DtpEndDate.SelectedDate   = (Get-Date).Date }
 
     # Bind the DataGrid to the observable collection
-    $script:State.Controls.DgConversations.ItemsSource = $script:State.RunDataView
-
-    # Initialize Core Adapter (Gate A)
-    try {
-        $coreRoot = Split-Path -Path (Resolve-Path $env:GENESYS_CORE_MODULE_PATH).Path -Parent | Split-Path -Parent
-        $catalogPath = Join-Path $coreRoot 'catalog/genesys.catalog.json'
-        $schemaPath = Join-Path $coreRoot 'catalog/schema/genesys.catalog.schema.json'
-        Initialize-CoreAdapter -CatalogPath $catalogPath -SchemaPath $schemaPath
-        Update-Status "Ready. Core engine initialized."
+    if ($c.ContainsKey('DgConversations')) {
+        $c.DgConversations.ItemsSource = $script:State.RunDataView
     }
-    catch {
-        Update-Status "FATAL: Could not initialize Genesys.Core. $($_.Exception.Message)" "Error"
-        [System.Windows.MessageBox]::Show("Could not initialize or validate Genesys.Core components. Check paths and catalog files.`n`n$($_.Exception.Message)", "Fatal Error", "OK", "Error")
-        $script:State.Window.Close()
+
+    # Initialize Core Adapter (Gate A) — skip in offline mode
+    if ($script:State.IsOffline) {
+        Update-Status '[Offline] Running in demo mode. Connect and Run features are disabled.'
+        if ($c.ContainsKey('BtnRun'))        { $c.BtnRun.IsEnabled        = $false }
+        if ($c.ContainsKey('BtnPreviewRun')) { $c.BtnPreviewRun.IsEnabled = $false }
+        if ($c.ContainsKey('BtnConnect'))    { $c.BtnConnect.IsEnabled    = $false }
+        return
+    }
+
+    if ([string]::IsNullOrWhiteSpace($env:GENESYS_CORE_MODULE_PATH)) {
+        Update-Status 'Warning: GENESYS_CORE_MODULE_PATH not set. Run features disabled until resolved.'
+        if ($c.ContainsKey('BtnRun'))        { $c.BtnRun.IsEnabled        = $false }
+        if ($c.ContainsKey('BtnPreviewRun')) { $c.BtnPreviewRun.IsEnabled = $false }
+    } else {
+        try {
+            # Derive catalog/schema paths from the module path.
+            # Expected layout: <CoreRoot>/modules/Genesys.Core/Genesys.Core.psd1
+            # Catalog at:      <CoreRoot>/catalog/...
+            $moduleFile = (Resolve-Path $env:GENESYS_CORE_MODULE_PATH -ErrorAction Stop).Path
+            $moduleDir  = Split-Path -Parent $moduleFile   # .../modules/Genesys.Core
+            $modulesDir = Split-Path -Parent $moduleDir    # .../modules
+            $coreRoot   = Split-Path -Parent $modulesDir   # <CoreRoot>
+
+            # Check env var overrides first, then derive
+            $catalogPath = if ($env:GENESYS_CORE_CATALOG_PATH) {
+                $env:GENESYS_CORE_CATALOG_PATH
+            } else {
+                Join-Path $coreRoot 'catalog\genesys.catalog.json'
+            }
+            $schemaPath = if ($env:GENESYS_CORE_SCHEMA_PATH) {
+                $env:GENESYS_CORE_SCHEMA_PATH
+            } else {
+                Join-Path $coreRoot 'catalog\schema\genesys.catalog.schema.json'
+            }
+
+            Initialize-CoreAdapter -CatalogPath $catalogPath -SchemaPath $schemaPath
+            Update-Status 'Ready. Core engine initialized.'
+        } catch {
+            $msg = "Could not initialize Genesys.Core.`n`n$($_.Exception.Message)`n`nRun ./scripts/Invoke-Smoke.ps1 -Verbose for diagnostics."
+            Update-Status "Warning: Core init failed. $($_.Exception.Message)"
+            [System.Windows.MessageBox]::Show($msg, 'Genesys Conversation Analysis - Warning', 'OK', 'Warning')
+            # Non-fatal: UI still opens; user can fix paths via app settings or env vars.
+        }
     }
 
     # Setup job state poller
@@ -121,115 +186,129 @@ function Initialize-Application {
 #endregion
 
 #region Event Handlers
+
 function Handle-ConnectClick {
-    Update-Status "Connecting..."
-    $script:State.Controls.BtnConnect.IsEnabled = $false
+    Update-Status 'Connecting...'
+    $c = $script:State.Controls
+    if ($c.ContainsKey('BtnConnect')) { $c.BtnConnect.IsEnabled = $false }
 
     try {
-        # This would be replaced with a settings window in a real app
-        $clientId = $env:GENESYS_CLIENT_ID
+        $clientId     = $env:GENESYS_CLIENT_ID
         $clientSecret = $env:GENESYS_CLIENT_SECRET
-        $region = 'usw2.pure.cloud' # Or from a settings file
+        $region       = if ($env:GENESYS_REGION) { $env:GENESYS_REGION } else { 'usw2.pure.cloud' }
 
-        if (-not ($clientId -and $clientSecret)) {
-            throw "GENESYS_CLIENT_ID and GENESYS_CLIENT_SECRET environment variables must be set."
+        if ([string]::IsNullOrWhiteSpace($clientId) -or [string]::IsNullOrWhiteSpace($clientSecret)) {
+            throw @"
+GENESYS_CLIENT_ID and GENESYS_CLIENT_SECRET must be set before connecting.
+
+Set them in your PowerShell session:
+  `$env:GENESYS_CLIENT_ID     = '<your-oauth-client-id>'
+  `$env:GENESYS_CLIENT_SECRET = '<your-oauth-client-secret>'
+  `$env:GENESYS_REGION        = 'usw2.pure.cloud'
+
+Then restart the app or re-click Connect.
+"@
         }
 
         $script:State.AuthContext = Connect-App -ClientId $clientId -ClientSecret $clientSecret -Region $region
-        $script:State.Controls.ElpConnStatus.Fill = $script:State.Controls.TryFindResource('BrushGreen')
-        $script:State.Controls.LblConnectionStatus.Text = "Connected to $($region)"
-        Update-Status "Connection successful."
-    }
-    catch {
-        $script:State.Controls.ElpConnStatus.Fill = $script:State.Controls.TryFindResource('BrushRed')
-        $script:State.Controls.LblConnectionStatus.Text = "Connection failed"
-        Update-Status "Connection failed: $($_.Exception.Message)" "Error"
-        [System.Windows.MessageBox]::Show($_.Exception.Message, "Connection Error", "OK", "Warning")
-    }
-    finally {
-        $script:State.Controls.BtnConnect.IsEnabled = $true
+
+        if ($c.ContainsKey('ElpConnStatus'))      { $c.ElpConnStatus.Fill      = [System.Windows.Media.Brushes]::LightGreen }
+        if ($c.ContainsKey('LblConnectionStatus')) { $c.LblConnectionStatus.Text = "Connected  |  $region  |  Client Credentials" }
+        Update-Status "Connected to $region"
+    } catch {
+        if ($c.ContainsKey('ElpConnStatus'))       { $c.ElpConnStatus.Fill      = [System.Windows.Media.Brushes]::Salmon }
+        if ($c.ContainsKey('LblConnectionStatus')) { $c.LblConnectionStatus.Text = 'Connection failed' }
+        Update-Status "Connection failed: $($_.Exception.Message)"
+        [System.Windows.MessageBox]::Show($_.Exception.Message, 'Connection Error', 'OK', 'Warning')
+    } finally {
+        if ($c.ContainsKey('BtnConnect')) { $c.BtnConnect.IsEnabled = $true }
     }
 }
 
 function Handle-RunClick($IsPreview) {
     if (-not $script:State.AuthContext) {
-        [System.Windows.MessageBox]::Show("Please connect to Genesys Cloud first.", "Not Connected", "OK", "Information")
+        [System.Windows.MessageBox]::Show(
+            'Please connect to Genesys Cloud first (click Connect).',
+            'Not Connected', 'OK', 'Information')
         return
     }
 
+    $c = $script:State.Controls
+
     # Assemble parameters
     $datasetKey = if ($IsPreview) { 'analytics-conversation-details-query' } else { 'analytics-conversation-details' }
-    $interval = "{0:s}Z/{1:s}Z" -f $script:State.Controls.DtpStartDate.SelectedDate.Value.ToUniversalTime(), $script:State.Controls.DtpEndDate.SelectedDate.Value.ToUniversalTime()
+    $start = $c.DtpStartDate.SelectedDate.Value.ToUniversalTime()
+    $end   = $c.DtpEndDate.SelectedDate.Value.ToUniversalTime()
+    $interval = "{0:s}Z/{1:s}Z" -f $start, $end
 
     # Build filters from UI controls
-    $segmentFilters = [System.Collections.Generic.List[object]]::new()
-    if ($script:State.Controls.TxtQueue.Text) {
+    $segmentFilters     = [System.Collections.Generic.List[object]]::new()
+    $conversationFilters = [System.Collections.Generic.List[object]]::new()
+
+    if ($c.ContainsKey('TxtQueue') -and -not [string]::IsNullOrWhiteSpace($c.TxtQueue.Text)) {
         $segmentFilters.Add(@{
             type = 'or'
-            predicates = @(
-                @{ dimension = 'queueId'; value = $script:State.Controls.TxtQueue.Text }
-            )
+            predicates = @(@{ dimension = 'queueId'; value = $c.TxtQueue.Text })
         })
     }
-
-    $conversationFilters = [System.Collections.Generic.List[object]]::new()
-    if ($script:State.Controls.CmbDirection.SelectedItem.Content -ne '(all)') {
+    if ($c.ContainsKey('CmbDirection') -and $c.CmbDirection.SelectedItem -and
+        $c.CmbDirection.SelectedItem.Content -ne '(all)') {
         $conversationFilters.Add(@{
             type = 'or'
-            predicates = @(
-                @{ dimension = 'direction'; value = $script:State.Controls.CmbDirection.SelectedItem.Content }
-            )
+            predicates = @(@{ dimension = 'direction'; value = $c.CmbDirection.SelectedItem.Content })
         })
     }
-    if ($script:State.Controls.CmbMediaType.SelectedItem.Content -ne '(all)') {
+    if ($c.ContainsKey('CmbMediaType') -and $c.CmbMediaType.SelectedItem -and
+        $c.CmbMediaType.SelectedItem.Content -ne '(all)') {
         $conversationFilters.Add(@{
             type = 'or'
-            predicates = @(
-                @{ dimension = 'mediaType'; value = $script:State.Controls.CmbMediaType.SelectedItem.Content }
-            )
+            predicates = @(@{ dimension = 'mediaType'; value = $c.CmbMediaType.SelectedItem.Content })
         })
     }
 
     $datasetParams = @{
-        interval = $interval
-        segmentFilters = $segmentFilters.ToArray()
+        interval            = $interval
+        segmentFilters      = $segmentFilters.ToArray()
         conversationFilters = $conversationFilters.ToArray()
     }
-    if ($IsPreview) { $datasetParams.paging = @{ pageSize = [int]$script:State.Controls.TxtPreviewPageSize.Text } }
+    if ($IsPreview -and $c.ContainsKey('TxtPreviewPageSize') -and
+        $c.TxtPreviewPageSize.Text -match '^\d+$') {
+        $datasetParams.paging = @{ pageSize = [int]$c.TxtPreviewPageSize.Text }
+    }
 
-    $outputRoot = Join-Path $env:LOCALAPPDATA "GenesysConversationAnalysis/runs"
-    if (-not (Test-Path $outputRoot)) { $null = New-Item -Path $outputRoot -ItemType Directory }
+    $outputRoot = [System.IO.Path]::Combine($env:LOCALAPPDATA, 'GenesysConversationAnalysis', 'runs')
+    if (-not (Test-Path $outputRoot)) { $null = New-Item -Path $outputRoot -ItemType Directory -Force }
 
     # Start the extraction job (Gate B)
     try {
         $script:State.CurrentRunJob = Start-CoreExtraction `
-            -DatasetKey $datasetKey `
-            -AuthContext $script:State.AuthContext `
-            -OutputRoot $outputRoot `
+            -DatasetKey        $datasetKey `
+            -AuthContext       $script:State.AuthContext `
+            -OutputRoot        $outputRoot `
             -DatasetParameters $datasetParams
 
-        Set-RunInProgressState($true)
+        Set-RunInProgressState $true
         $script:State.JobStatePoller.Start()
         $script:State.RunMonitorTimer.Start()
-        $script:State.Controls.TabWorkspace.SelectedIndex = 2 # Switch to Run Console
-        Update-Status "Starting run for dataset '$($datasetKey)'..."
-    }
-    catch {
-        Update-Status "Failed to start run: $($_.Exception.Message)" "Error"
+        if ($c.ContainsKey('TabWorkspace')) { $c.TabWorkspace.SelectedIndex = 2 }
+        Update-Status "Starting run for dataset '$datasetKey'..."
+    } catch {
+        Update-Status "Failed to start run: $($_.Exception.Message)"
+        [System.Windows.MessageBox]::Show($_.Exception.Message, 'Run Error', 'OK', 'Error')
     }
 }
 
 function Handle-CancelRunClick {
     if ($script:State.CurrentRunJob) {
-        Update-Status "Cancelling run..."
-        Stop-Job -Job $script:State.CurrentRunJob
-        # The Check-JobState handler will do the final cleanup
+        Update-Status 'Cancelling run...'
+        Stop-Job -Job $script:State.CurrentRunJob -ErrorAction SilentlyContinue
     }
 }
 
 function Handle-OpenRunClick {
+    Add-Type -AssemblyName System.Windows.Forms
     $dialog = [System.Windows.Forms.FolderBrowserDialog]::new()
-    $dialog.Description = "Select a Genesys.Core run folder"
+    $dialog.Description        = 'Select a Genesys.Core run folder'
     $dialog.ShowNewFolderButton = $false
     if ($dialog.ShowDialog() -eq 'OK') {
         Load-Run -RunFolder $dialog.SelectedPath
@@ -237,56 +316,57 @@ function Handle-OpenRunClick {
 }
 
 function Handle-SearchClick {
-    $searchText = $script:State.Controls.TxtSearch.Text
+    $c          = $script:State.Controls
+    $searchText = if ($c.ContainsKey('TxtSearch')) { $c.TxtSearch.Text } else { '' }
+
     if ([string]::IsNullOrWhiteSpace($searchText)) {
         $script:State.FilteredIndex = $script:State.RunIndex
-        Update-Status "Search cleared."
-    }
-    else {
-        Update-Status "Searching for '$searchText'..."
-        # Filter the index locally. Since the index is lightweight, this is fast.
-        $script:State.FilteredIndex = $script:State.RunIndex | Where-Object {
-            $_.ConversationId -like "*$searchText*"
-        }
-        Update-Status "Found $($script:State.FilteredIndex.Count) matches."
+        Update-Status 'Search cleared.'
+    } else {
+        $lo = $searchText.ToLowerInvariant()
+        $script:State.FilteredIndex = @($script:State.RunIndex | Where-Object {
+            $_.ConversationId -like "*$lo*"
+        })
+        Update-Status "Found $($script:State.FilteredIndex.Count) matches for '$searchText'."
     }
     Load-ConversationPage -PageIndex 0
 }
 
 function Handle-ExportClick($Scope) {
+    Add-Type -AssemblyName System.Windows.Forms
     $dialog = [System.Windows.Forms.SaveFileDialog]::new()
-    $dialog.Filter = "CSV Files (*.csv)|*.csv"
-    $dialog.FileName = "export_$Scope_$(Get-Date -Format 'yyyyMMdd-HHmm').csv"
+    $dialog.Filter   = 'CSV Files (*.csv)|*.csv'
+    $dialog.FileName = "export_${Scope}_$(Get-Date -Format 'yyyyMMdd-HHmm').csv"
 
     if ($dialog.ShowDialog() -eq 'OK') {
         Update-Status "Exporting $Scope to $($dialog.FileName)..."
         try {
             if ($Scope -eq 'Page') {
                 $script:State.RunDataView | Export-Csv -Path $dialog.FileName -NoTypeInformation
-            }
-            elseif ($Scope -eq 'Run') {
-                if (-not $script:State.CurrentRun) { throw "No run loaded." }
+            } elseif ($Scope -eq 'Run') {
+                if (-not $script:State.CurrentRun) { throw 'No run loaded. Open a run folder first.' }
                 Export-RunToCsv -RunFolder $script:State.CurrentRun.runFolder -OutputPath $dialog.FileName
             }
-            Update-Status "Export complete."
-        }
-        catch {
-            Update-Status "Export failed: $($_.Exception.Message)" "Error"
-            [System.Windows.MessageBox]::Show($_.Exception.Message, "Export Error", "OK", "Error")
+            Update-Status 'Export complete.'
+        } catch {
+            Update-Status "Export failed: $($_.Exception.Message)"
+            [System.Windows.MessageBox]::Show($_.Exception.Message, 'Export Error', 'OK', 'Error')
         }
     }
 }
 
 function Handle-GenerateReportClick {
-    Update-Status "Generating impact report..."
+    Update-Status 'Generating impact report...'
     try {
-        $reportTitle = "Impact Report: $($script:State.Controls.TxtSearch.Text)"
-        $report = New-ImpactReport -FilteredIndex $script:State.FilteredIndex -ReportTitle $reportTitle
-        $script:State.Controls.TxtDrillSummary.Text = $report | ConvertTo-Json -Depth 8
-        Update-Status "Impact report generated."
-    }
-    catch {
-        Update-Status "Failed to generate report: $($_.Exception.Message)" "Error"
+        $searchText = ''
+        if ($script:State.Controls.ContainsKey('TxtSearch')) { $searchText = $script:State.Controls.TxtSearch.Text }
+        $report = New-ImpactReport -FilteredIndex $script:State.FilteredIndex -ReportTitle "Impact Report: $searchText"
+        if ($script:State.Controls.ContainsKey('TxtDrillSummary')) {
+            $script:State.Controls.TxtDrillSummary.Text = $report | ConvertTo-Json -Depth 8
+        }
+        Update-Status 'Impact report generated.'
+    } catch {
+        Update-Status "Failed to generate report: $($_.Exception.Message)"
     }
 }
 
@@ -294,73 +374,70 @@ function Handle-PagingClick($Direction) {
     $newIndex = $script:State.PageIndex
     if ($Direction -eq 'Next') { $newIndex++ }
     if ($Direction -eq 'Prev') { $newIndex-- }
-
     Load-ConversationPage -PageIndex $newIndex
 }
 
 function Handle-ConversationSelectionChanged {
-    $selectedItem = $script:State.Controls.DgConversations.SelectedItem
+    $c            = $script:State.Controls
+    $selectedItem = if ($c.ContainsKey('DgConversations')) { $c.DgConversations.SelectedItem } else { $null }
     if (-not $selectedItem) { return }
 
-    # Load the full record for drilldown (Gate C)
+    # Gate C: Load full record for drilldown
     $fullRecord = Get-RunRecordById -Index $script:State.RunIndex -ConversationId $selectedItem.ConversationId
     if (-not $fullRecord) { return }
 
-    # Update Drilldown Tab
-    $script:State.Controls.LblSelectedConversation.Text = $fullRecord.conversationId
-    $script:State.Controls.TabWorkspace.SelectedIndex = 1 # Switch to Drilldown
+    if ($c.ContainsKey('LblSelectedConversation')) { $c.LblSelectedConversation.Text = $fullRecord.conversationId }
+    if ($c.ContainsKey('TabWorkspace'))             { $c.TabWorkspace.SelectedIndex   = 1 }
+    if ($c.ContainsKey('TxtRawJson'))               { $c.TxtRawJson.Text              = $fullRecord | ConvertTo-Json -Depth 10 }
+    if ($c.ContainsKey('DgParticipants') -and $fullRecord.PSObject.Properties['participants']) {
+        $c.DgParticipants.ItemsSource = $fullRecord.participants
+    }
 
-    # Populate drilldown sub-tabs
-    $script:State.Controls.TxtRawJson.Text = $fullRecord | ConvertTo-Json -Depth 10
-    $script:State.Controls.DgParticipants.ItemsSource = $fullRecord.participants
-
-    # Flatten segments for easier viewing in the grid
-    $allSegments = [System.Collections.Generic.List[object]]::new()
-    foreach ($p in $fullRecord.participants) {
-        foreach ($s in $p.sessions) {
-            foreach ($seg in $s.segments) {
-                $seg.PSObject.Properties.Add([psnoteproperty]::new('ParticipantPurpose', $p.purpose))
-                $seg.PSObject.Properties.Add([psnoteproperty]::new('ParticipantName', $p.participantName))
-                $allSegments.Add($seg)
+    # Flatten segments for grid view
+    if ($c.ContainsKey('DgSegments') -and $fullRecord.PSObject.Properties['participants']) {
+        $allSegments = [System.Collections.Generic.List[object]]::new()
+        foreach ($p in $fullRecord.participants) {
+            if (-not $p.PSObject.Properties['sessions']) { continue }
+            foreach ($s in $p.sessions) {
+                if (-not $s.PSObject.Properties['segments']) { continue }
+                foreach ($seg in $s.segments) {
+                    try { $seg.PSObject.Properties.Add([psnoteproperty]::new('ParticipantPurpose', $p.purpose)) } catch { }
+                    try { $seg.PSObject.Properties.Add([psnoteproperty]::new('ParticipantName',    $p.participantName)) } catch { }
+                    $allSegments.Add($seg)
+                }
             }
         }
+        $c.DgSegments.ItemsSource = $allSegments
     }
-    $script:State.Controls.DgSegments.ItemsSource = $allSegments
 }
-
-# ... other handlers ...
 #endregion
 
 #region Job and Run Monitoring
+
 function Check-JobState {
     $job = $script:State.CurrentRunJob
-    if (-not $job) {
-        $script:State.JobStatePoller.Stop()
-        return
-    }
+    if (-not $job) { $script:State.JobStatePoller.Stop(); return }
 
-    # Update progress from job state
-    $script:State.Controls.TxtRunStatus.Text = "Run status: $($job.State)"
-    if ($job.State -in 'Running', 'Completed', 'Failed', 'Stopped') {
-        # Receive job output (the run object)
-        if ($job.HasMoreData) {
-            $runObject = Receive-Job -Job $job -Keep
-            if ($runObject -and -not $script:State.CurrentRun) {
-                $script:State.CurrentRun = $runObject
-            }
+    $c = $script:State.Controls
+    if ($c.ContainsKey('TxtRunStatus')) { $c.TxtRunStatus.Text = "Run status: $($job.State)" }
+
+    if ($job.HasMoreData) {
+        $runObject = Receive-Job -Job $job -Keep -ErrorAction SilentlyContinue
+        if ($runObject -and -not $script:State.CurrentRun) {
+            $script:State.CurrentRun = $runObject
         }
     }
 
-    # Finalize on completion
     if ($job.State -in 'Completed', 'Failed', 'Stopped') {
         $script:State.JobStatePoller.Stop()
         $script:State.RunMonitorTimer.Stop()
-        Remove-Job -Job $job
+        $finalState = $job.State
+        Remove-Job -Job $job -ErrorAction SilentlyContinue
         $script:State.CurrentRunJob = $null
-        Set-RunInProgressState($false)
-        Update-Status "Run finished with status: $($job.State)."
+        Set-RunInProgressState $false
+        Update-Status "Run finished with status: $finalState."
 
-        if ($job.State -eq 'Completed') {
+        if ($finalState -eq 'Completed' -and $script:State.CurrentRun) {
             Load-Run -RunFolder $script:State.CurrentRun.runFolder
         }
     }
@@ -368,105 +445,112 @@ function Check-JobState {
 #endregion
 
 #region UI Helpers
+
 function Update-Status($Message, $Level = 'Info') {
-    $script:State.Controls.TxtStatusMain.Text = $Message
-    # Could also change status bar color based on level
+    $c = $script:State.Controls
+    if ($c.ContainsKey('TxtStatusMain')) { $c.TxtStatusMain.Text = $Message }
 }
 
 function Set-RunInProgressState($IsRunning) {
-    $script:State.Controls.BtnPreviewRun.IsEnabled = -not $IsRunning
-    $script:State.Controls.BtnRun.IsEnabled = -not $IsRunning
-    $script:State.Controls.BtnCancelRun.IsEnabled = $IsRunning
-    $script:State.Controls.PrgRun.IsIndeterminate = $IsRunning
-    if (-not $IsRunning) {
-        $script:State.Controls.PrgRun.Value = 0
+    $c = $script:State.Controls
+    if ($c.ContainsKey('BtnPreviewRun')) { $c.BtnPreviewRun.IsEnabled = -not $IsRunning }
+    if ($c.ContainsKey('BtnRun'))        { $c.BtnRun.IsEnabled        = -not $IsRunning }
+    if ($c.ContainsKey('BtnCancelRun'))  { $c.BtnCancelRun.IsEnabled  = $IsRunning }
+    if ($c.ContainsKey('PrgRun')) {
+        $c.PrgRun.IsIndeterminate = $IsRunning
+        if (-not $IsRunning) { $c.PrgRun.Value = 0 }
     }
 }
 
 function Update-ProgressFromArtifacts {
     if (-not $script:State.CurrentRun) { return }
 
-    $runFolder = $script:State.CurrentRun.runFolder
+    $runFolder   = $script:State.CurrentRun.runFolder
     $summaryPath = Join-Path $runFolder 'summary.json'
-    $eventsPath = Join-Path $runFolder 'events.jsonl'
+    $eventsPath  = Join-Path $runFolder 'events.jsonl'
+    $c           = $script:State.Controls
 
-    # Update from summary.json
-    if (Test-Path $summaryPath) {
-        $summary = Get-Content -Raw -Path $summaryPath | ConvertFrom-Json
-        $script:State.Controls.TxtRunProgress.Text = "Records: $($summary.recordCount) | Errors: $($summary.errorCount) | Elapsed: $($summary.elapsed)"
-        $script:State.Controls.TxtConsoleStatus.Text = $summary.status
+    if ((Test-Path $summaryPath) -and $c.ContainsKey('TxtRunProgress')) {
+        try {
+            $summary = Get-Content -Raw -Path $summaryPath | ConvertFrom-Json
+            $c.TxtRunProgress.Text = "Records: $($summary.recordCount)  |  Errors: $($summary.errorCount)  |  Elapsed: $($summary.elapsed)"
+            if ($c.ContainsKey('TxtConsoleStatus')) { $c.TxtConsoleStatus.Text = $summary.status }
+        } catch { }
     }
 
-    # Update from events.jsonl
-    if (Test-Path $eventsPath) {
-        # In a real app, you would tail this file and only read new lines.
-        # For simplicity here, we re-read it.
-        $events = Get-Content -Path $eventsPath | ConvertFrom-Json
-        $script:State.Controls.DgRunEvents.ItemsSource = $events
-        if ($events) {
-            $script:State.Controls.DgRunEvents.ScrollIntoView($events[-1])
-        }
+    if ((Test-Path $eventsPath) -and $c.ContainsKey('DgRunEvents')) {
+        try {
+            $events = Get-Content -Path $eventsPath | ConvertFrom-Json
+            $c.DgRunEvents.ItemsSource = $events
+            if ($events -and $c.DgRunEvents.Items.Count -gt 0) {
+                $c.DgRunEvents.ScrollIntoView($events[-1])
+            }
+        } catch { }
     }
 }
 
 function Load-Run {
     [CmdletBinding()]
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$RunFolder
-    )
+    param([Parameter(Mandatory)][string]$RunFolder)
 
-    Update-Status "Loading run from '$($RunFolder)'..."
+    Update-Status "Loading run from '$RunFolder'..."
     $script:State.CurrentRun = @{ runFolder = $RunFolder }
     $indexPath = Join-Path $RunFolder 'index.jsonl'
 
-    # Gate C: Build or load the index for the run
+    # Gate C: Build or load the run index
     if (Test-Path $indexPath) {
-        Update-Status "Loading existing index..."
-        $script:State.RunIndex = Get-Content -Raw -Path $indexPath | ConvertFrom-Json
-    }
-    else {
-        Update-Status "No index found. Building index for run... (this may take a moment)"
-        # Use dispatcher to allow UI to update before blocking on index build
-        $script:State.Window.Dispatcher.InvokeAsync({
+        Update-Status 'Loading existing index...'
+        try {
+            $script:State.RunIndex = Get-Content -Raw -Path $indexPath | ConvertFrom-Json
+        } catch {
+            Update-Status "Index file unreadable; rebuilding. $_"
             $script:State.RunIndex = Build-RunIndex -RunFolder $RunFolder
+        }
+    } else {
+        Update-Status 'No index found. Building index (may take a moment for large runs)...'
+        $script:State.Window.Dispatcher.InvokeAsync({
+            $script:State.RunIndex    = Build-RunIndex -RunFolder $RunFolder
             $script:State.FilteredIndex = $script:State.RunIndex
-            Update-Status "Index built. $($script:State.RunIndex.Count) records found."
+            Update-Status "Index built. $($script:State.RunIndex.Count) records."
             Load-ConversationPage -PageIndex 0
         }) | Out-Null
         return
     }
 
-    Update-Status "Run loaded. $($script:State.RunIndex.Count) records indexed."
     $script:State.FilteredIndex = $script:State.RunIndex
+    Update-Status "Run loaded. $($script:State.RunIndex.Count) records indexed."
     Load-ConversationPage -PageIndex 0
-    $script:State.Controls.TabWorkspace.SelectedIndex = 0 # Switch to Conversations tab
+    if ($script:State.Controls.ContainsKey('TabWorkspace')) {
+        $script:State.Controls.TabWorkspace.SelectedIndex = 0
+    }
 }
 
 function Load-ConversationPage {
     [CmdletBinding()]
     param([int]$PageIndex)
 
-    $totalRecords = $script:State.FilteredIndex.Count
-    if ($totalRecords -eq 0) {
+    $total = $script:State.FilteredIndex.Count
+    $c     = $script:State.Controls
+
+    if ($total -eq 0) {
         $script:State.RunDataView.Clear()
-        $script:State.Controls.TxtPageInfo.Text = "0 records found"
+        if ($c.ContainsKey('TxtPageInfo')) { $c.TxtPageInfo.Text = '0 records found' }
         return
     }
 
-    $totalPages = [math]::Ceiling($totalRecords / $script:State.PageSize)
-    if ($PageIndex -lt 0 -or $PageIndex -ge $totalPages) { return } # Out of bounds
+    $totalPages = [math]::Ceiling($total / $script:State.PageSize)
+    if ($PageIndex -lt 0 -or $PageIndex -ge $totalPages) { return }
 
     $script:State.PageIndex = $PageIndex
-    Update-Status "Loading page $($PageIndex + 1) of $($totalPages)..."
+    Update-Status "Loading page $($PageIndex + 1) of $totalPages..."
 
     $pageData = Get-RunPage -Index $script:State.FilteredIndex -PageIndex $PageIndex -PageSize $script:State.PageSize
     $script:State.RunDataView.Clear()
-    $pageData.ForEach({ $script:State.RunDataView.Add($_) })
+    foreach ($item in $pageData) { $script:State.RunDataView.Add($item) }
 
-    $script:State.Controls.TxtPageInfo.Text = "Page $($PageIndex + 1) of $($totalPages)  |  $($totalRecords) records"
-    $script:State.Controls.BtnPrevPage.IsEnabled = ($PageIndex > 0)
-    $script:State.Controls.BtnNextPage.IsEnabled = ($PageIndex < ($totalPages - 1))
+    if ($c.ContainsKey('TxtPageInfo'))  { $c.TxtPageInfo.Text              = "Page $($PageIndex + 1) of $totalPages  |  $total records" }
+    if ($c.ContainsKey('BtnPrevPage'))  { $c.BtnPrevPage.IsEnabled          = ($PageIndex -gt 0) }
+    if ($c.ContainsKey('BtnNextPage'))  { $c.BtnNextPage.IsEnabled          = ($PageIndex -lt ($totalPages - 1)) }
     Update-Status "Page $($PageIndex + 1) loaded."
 }
 #endregion

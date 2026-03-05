@@ -1,26 +1,51 @@
+#Requires -Version 5.1
+<#
+.SYNOPSIS
+    DEPRECATED launcher – use ./App.ps1 instead.
+.DESCRIPTION
+    This script is a backwards-compatibility shim. It forwards all arguments
+    to the canonical entrypoint (./App.ps1) and prints a deprecation warning.
+
+    Supported launch command (canonical):
+        pwsh -NoProfile -ExecutionPolicy Bypass -File ./App.ps1
+
+    Supported parameters (forwarded to App.ps1):
+        -GenesysCoreModulePath <path>   Override Genesys.Core module path
+        -GenesysAuthModulePath <path>   Override Genesys.Auth module path
+        -Offline                        Start in offline/demo mode
+#>
 [CmdletBinding()]
-param (
-    # This makes the app detachable, as required by acceptance tests.
-    # In a CI/CD or production deployment, this would be set globally.
+param(
     [string]$GenesysCoreModulePath = $env:GENESYS_CORE_MODULE_PATH,
-    [string]$GenesysAuthModulePath = $env:GENESYS_AUTH_MODULE_PATH
+    [string]$GenesysAuthModulePath = $env:GENESYS_AUTH_MODULE_PATH,
+    [switch]$Offline
 )
 
-Set-StrictMode -Version Latest
-$ErrorActionPreference = 'Stop'
+Write-Warning @"
 
-# Set environment variables for the child modules to consume.
-# This is the cleanest way to pass dependency paths without polluting function signatures.
-if ($GenesysCoreModulePath) { $env:GENESYS_CORE_MODULE_PATH = $GenesysCoreModulePath }
-if ($GenesysAuthModulePath) { $env:GENESYS_AUTH_MODULE_PATH = $GenesysAuthModulePath }
+  DEPRECATED LAUNCHER
+  -------------------
+  This script (XAML/Run-ConversationAnalytics.ps1) is deprecated and will be
+  removed in a future release.
 
-if (-not $env:GENESYS_CORE_MODULE_PATH) {
-    throw "FATAL: GENESYS_CORE_MODULE_PATH environment variable is not set. Cannot locate Genesys.Core."
+  Use the canonical entrypoint instead:
+      pwsh -NoProfile -ExecutionPolicy Bypass -File ./App.ps1
+
+  Forwarding to ./App.ps1 now...
+
+"@
+
+$canonicalEntry = Join-Path (Split-Path -Parent $PSScriptRoot) 'App.ps1'
+
+if (-not (Test-Path -LiteralPath $canonicalEntry)) {
+    Write-Error "Cannot find canonical entrypoint at: $canonicalEntry"
+    exit 1
 }
 
-$scriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Definition
+$forwardParams = @{}
+if ($GenesysCoreModulePath) { $forwardParams['GenesysCoreModulePath'] = $GenesysCoreModulePath }
+if ($GenesysAuthModulePath) { $forwardParams['GenesysAuthModulePath'] = $GenesysAuthModulePath }
+if ($Offline)               { $forwardParams['Offline']               = $true }
 
-# Import the UI module and start the application.
-Import-Module (Join-Path $scriptRoot 'App.UI.ps1') -Force
-
-Show-ConversationAnalysisWindow
+& $canonicalEntry @forwardParams
+exit $LASTEXITCODE

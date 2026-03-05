@@ -1,122 +1,135 @@
 #Requires -Version 5.1
+[CmdletBinding()]
+param(
+    # Explicit path to Genesys.Core module manifest (.psd1).
+    # Overrides env:GENESYS_CORE_MODULE_PATH and appsettings.json.
+    [string]$GenesysCoreModulePath = '',
+
+    # Explicit path to Genesys.Auth module manifest (.psd1).
+    # Overrides env:GENESYS_AUTH_MODULE_PATH and appsettings.json.
+    [string]$GenesysAuthModulePath = '',
+
+    # Skip dependency resolution and auth preflight; launch UI in offline/demo mode.
+    # Equivalent to setting APP_OFFLINE=1 in the environment.
+    [switch]$Offline
+)
 Set-StrictMode -Version Latest
 
 <#
 .SYNOPSIS
-    Genesys Conversation Analysis – entry point.
+    Genesys Conversation Analysis - canonical entrypoint.
 .DESCRIPTION
-    1. Loads WPF assemblies.
-    2. Imports app modules (never Genesys.Core directly – Gate D).
-    3. Resolves Core paths from config + env overrides.
-    4. Calls Initialize-CoreAdapter (Gate A).
-    5. Loads XAML\MainWindow.xaml.
-    6. Dot-sources App.UI.ps1.
-    7. Wires Window.Closing to persist LastStartDate / LastEndDate.
-    8. Runs the WPF message loop.
+    Supported launch command:
+        pwsh -NoProfile -ExecutionPolicy Bypass -File ./App.ps1
+
+    Startup sequence:
+        1. Import App.Config.psm1 (provides Resolve-DependencyPaths, Invoke-AuthPreflight).
+        2. Resolve Genesys.Core and Genesys.Auth module paths (4-level precedence).
+        3. Set GENESYS_CORE_MODULE_PATH / GENESYS_AUTH_MODULE_PATH for child modules.
+        4. Auth preflight: warn if required env vars are missing (non-fatal).
+        5. Load WPF assemblies.
+        6. Import XAML/App.UI.ps1 and launch Show-ConversationAnalysisWindow.
+
+    Offline mode (-Offline or APP_OFFLINE=1):
+        Steps 2-4 are skipped. The UI launches with extraction features disabled.
+
+    Path resolution precedence (first valid .psd1 wins):
+        (a) CLI parameters  -GenesysCoreModulePath / -GenesysAuthModulePath
+        (b) Environment     GENESYS_CORE_MODULE_PATH / GENESYS_AUTH_MODULE_PATH
+        (c) Repo config     ./appsettings.json  (keys: GenesysCoreModulePath, GenesysAuthModulePath)
+        (d) Auto-detect     ./modules/Genesys.Core/Genesys.Core.psd1 (if present)
+
+    Auth mode (GENESYS_AUTH_MODE env var, default: client_credentials):
+        client_credentials  -> requires GENESYS_CLIENT_ID, GENESYS_CLIENT_SECRET, GENESYS_REGION
+        pkce                -> requires GENESYS_CLIENT_ID, GENESYS_REGION
+        bearer              -> requires GENESYS_BEARER_TOKEN
+
+    If startup fails: run ./scripts/Invoke-Smoke.ps1 -Verbose for diagnostics.
 #>
 
 $AppDir = $PSScriptRoot
 if (-not $AppDir) { $AppDir = Split-Path -Parent $MyInvocation.MyCommand.Path }
 
-# ── 1. WPF assemblies ─────────────────────────────────────────────────────────
-Add-Type -AssemblyName PresentationFramework
-Add-Type -AssemblyName PresentationCore
-Add-Type -AssemblyName WindowsBase
-Add-Type -AssemblyName System.Xaml
-Add-Type -AssemblyName Microsoft.Win32.Primitives  -ErrorAction SilentlyContinue
-
-# ── 2. Import app modules ─────────────────────────────────────────────────────
-# Order matters: Config → Auth → CoreAdapter → Index → Export
-Import-Module (Join-Path $AppDir 'App.Config.psm1')      -Force -ErrorAction Stop
-Import-Module (Join-Path $AppDir 'App.Auth.psm1')         -Force -ErrorAction Stop
-Import-Module (Join-Path $AppDir 'App.CoreAdapter.psm1')  -Force -ErrorAction Stop
-Import-Module (Join-Path $AppDir 'App.Index.psm1')        -Force -ErrorAction Stop
-Import-Module (Join-Path $AppDir 'App.Export.psm1')       -Force -ErrorAction Stop
-
-# ── 3. Resolve Core paths (env overrides take precedence) ────────────────────
-$cfg = Get-AppConfig
-
-$corePath    = if ($env:GENESYS_CORE_MODULE)  { $env:GENESYS_CORE_MODULE  } else { $cfg.CoreModulePath }
-$catalogPath = if ($env:GENESYS_CORE_CATALOG) { $env:GENESYS_CORE_CATALOG } else { $cfg.CatalogPath    }
-$schemaPath  = if ($env:GENESYS_CORE_SCHEMA)  { $env:GENESYS_CORE_SCHEMA  } else { $cfg.SchemaPath     }
-$outputRoot  = $cfg.OutputRoot
-
-# ── 4. Gate A: Initialize CoreAdapter ────────────────────────────────────────
+# ── 1. Import App.Config.psm1 ─────────────────────────────────────────────────
 try {
-    Initialize-CoreAdapter `
-        -CoreModulePath $corePath `
-        -CatalogPath    $catalogPath `
-        -OutputRoot     $outputRoot `
-        -SchemaPath     $schemaPath
+    Import-Module (Join-Path $AppDir 'App.Config.psm1') -Force -ErrorAction Stop
 } catch {
-    $errMsg = "Fatal startup error (Gate A – CoreAdapter init failed):`n`n$_`n`nVerify paths:`n  Core   : $corePath`n  Catalog: $catalogPath`n`nFix configuration via Settings or set GENESYS_CORE_MODULE / GENESYS_CORE_CATALOG env vars."
-    [System.Windows.MessageBox]::Show($errMsg, 'Genesys Conversation Analysis – Startup Error',
-        [System.Windows.MessageBoxButton]::OK,
-        [System.Windows.MessageBoxImage]::Error) | Out-Null
+    Write-Error "Fatal: Cannot import App.Config.psm1 from '$AppDir': $_"
     exit 1
 }
 
-# ── 5. Load XAML ──────────────────────────────────────────────────────────────
-$xamlPath = Join-Path $AppDir 'XAML\MainWindow.xaml'
-if (-not [System.IO.File]::Exists($xamlPath)) {
-    [System.Windows.MessageBox]::Show(
-        "XAML file not found: $xamlPath",
-        'Startup Error') | Out-Null
-    exit 1
-}
+# ── 2 & 3. Resolve dependency paths and propagate as env vars ─────────────────
+$isOffline = $Offline.IsPresent -or ($env:APP_OFFLINE -eq '1')
 
-$xamlContent = [System.IO.File]::ReadAllText($xamlPath, [System.Text.Encoding]::UTF8)
-# Remove x:Class attribute so WPF doesn't try to find a compiled backing class
-$xamlContent = $xamlContent -replace 'x:Class="[^"]*"', ''
-
-$reader = New-Object System.IO.StringReader($xamlContent)
-$xmlReader = [System.Xml.XmlReader]::Create($reader)
-try {
-    $script:Window = [System.Windows.Markup.XamlReader]::Load($xmlReader)
-} catch {
-    [System.Windows.MessageBox]::Show(
-        "Failed to load XAML: $_",
-        'Startup Error') | Out-Null
-    exit 1
-} finally {
-    $xmlReader.Dispose()
-    $reader.Dispose()
-}
-
-# ── 6. Dot-source App.UI.ps1 ─────────────────────────────────────────────────
-. (Join-Path $AppDir 'App.UI.ps1')
-
-# ── 7. Wire Window.Closing – persist dates and stop background run ────────────
-$script:Window.Add_Closing({
-    param($sender, $e)
-
-    # Stop polling timer
-    if ($null -ne $script:State.PollingTimer) {
-        try { $script:State.PollingTimer.Stop() } catch { }
-    }
-
-    # Stop background runspace
-    if ($null -ne $script:State.BackgroundRunJob) {
-        try { $script:State.BackgroundRunJob.Ps.Stop() } catch { }
-    }
-    if ($null -ne $script:State.BackgroundRunspace) {
-        try { $script:State.BackgroundRunspace.Close() } catch { }
-    }
-
-    # Persist last dates
+if (-not $isOffline) {
     try {
-        $startDate = $script:DtpStartDate.SelectedDate
-        $endDate   = $script:DtpEndDate.SelectedDate
-        $cfg2 = Get-AppConfig
-        if ($null -ne $startDate) {
-            $cfg2 | Add-Member -NotePropertyName 'LastStartDate' -NotePropertyValue $startDate.Value.ToString('o') -Force
-        }
-        if ($null -ne $endDate) {
-            $cfg2 | Add-Member -NotePropertyName 'LastEndDate' -NotePropertyValue $endDate.Value.ToString('o') -Force
-        }
-        Save-AppConfig -Config $cfg2
-    } catch { <# non-fatal #> }
-})
+        $resolved = Resolve-DependencyPaths `
+            -GenesysCoreModulePath $GenesysCoreModulePath `
+            -GenesysAuthModulePath $GenesysAuthModulePath `
+            -RepoRoot              $AppDir
+        # Propagate to environment so XAML child modules can find the dependencies.
+        $env:GENESYS_CORE_MODULE_PATH = $resolved.CoreModulePath
+        $env:GENESYS_AUTH_MODULE_PATH = $resolved.AuthModulePath
+        Write-Verbose "Core  : $($resolved.CoreModulePath)"
+        Write-Verbose "Auth  : $($resolved.AuthModulePath)"
+    } catch {
+        # Show a console error + a message box so the failure is visible
+        # whether run interactively or via shortcut.
+        $errMsg = "Startup failed - dependency resolution error:`n`n$_"
+        Write-Error $errMsg
+        try {
+            Add-Type -AssemblyName PresentationFramework -ErrorAction Stop
+            [System.Windows.MessageBox]::Show(
+                $errMsg,
+                'Genesys Conversation Analysis - Startup Error',
+                [System.Windows.MessageBoxButton]::OK,
+                [System.Windows.MessageBoxImage]::Error
+            ) | Out-Null
+        } catch { }
+        exit 1
+    }
 
-# ── 8. Run WPF message loop ───────────────────────────────────────────────────
-$script:Window.ShowDialog() | Out-Null
+    # ── 4. Auth preflight (non-fatal: warns but does not block launch) ────────
+    Invoke-AuthPreflight
+} else {
+    Write-Host '[Offline] Skipping dependency resolution and auth preflight. UI runs in read-only demo mode.'
+}
+
+# ── 5. Load WPF assemblies ────────────────────────────────────────────────────
+try {
+    Add-Type -AssemblyName PresentationFramework  -ErrorAction Stop
+    Add-Type -AssemblyName PresentationCore       -ErrorAction Stop
+    Add-Type -AssemblyName WindowsBase            -ErrorAction Stop
+    Add-Type -AssemblyName System.Xaml            -ErrorAction Stop
+    Add-Type -AssemblyName Microsoft.Win32.Primitives -ErrorAction SilentlyContinue
+} catch {
+    Write-Error "Fatal: Failed to load WPF assemblies. This app requires Windows with .NET/WPF: $_"
+    exit 1
+}
+
+# ── 6. Import XAML/App.UI.ps1 and launch UI ──────────────────────────────────
+$xamlDir = Join-Path $AppDir 'XAML'
+$uiScript = Join-Path $xamlDir 'App.UI.ps1'
+
+if (-not [System.IO.File]::Exists($uiScript)) {
+    $msg = "Fatal: UI script not found at '$uiScript'. Repository may be incomplete."
+    Write-Error $msg
+    try {
+        [System.Windows.MessageBox]::Show($msg, 'Genesys Conversation Analysis - Startup Error',
+            [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Error) | Out-Null
+    } catch { }
+    exit 1
+}
+
+try {
+    Import-Module $uiScript -Force -ErrorAction Stop
+    Show-ConversationAnalysisWindow
+} catch {
+    $msg = "Fatal startup error in UI:`n`n$_`n`nRun ./scripts/Invoke-Smoke.ps1 -Verbose for diagnostics."
+    Write-Error $msg
+    try {
+        [System.Windows.MessageBox]::Show($msg, 'Genesys Conversation Analysis - Startup Error',
+            [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Error) | Out-Null
+    } catch { }
+    exit 1
+}
